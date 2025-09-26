@@ -1,0 +1,74 @@
+name: Sync Fork with Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect upstream repository
+        id: upstream
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          api="https://api.github.com/repos/${REPO}"
+          json=$(curl -sS \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "$api")
+          parent=$(echo "$json" | jq -r '.parent.clone_url // empty')
+          branch=$(echo "$json" | jq -r '.parent.default_branch // empty')
+          if [ -z "$parent" ]; then
+            echo "Repository has no parent to sync from."
+            exit 0
+          fi
+          echo "upstream=$parent" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        if: steps.upstream.outputs.upstream != ''
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git author
+        if: steps.upstream.outputs.upstream != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync default branch from upstream
+        if: steps.upstream.outputs.upstream != ''
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.upstream }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+        run: |
+          DEFAULT_BRANCH=${BRANCH:-$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')}
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "Unable to determine default branch." >&2
+            exit 1
+          fi
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream "$DEFAULT_BRANCH"
+          if git show-ref --verify --quiet "refs/heads/$DEFAULT_BRANCH"; then
+            git checkout "$DEFAULT_BRANCH"
+          else
+            git checkout -b "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+          fi
+          git merge --ff-only "upstream/$DEFAULT_BRANCH"
+          git push origin "$DEFAULT_BRANCH"
+
+      - name: Sync tags
+        if: steps.upstream.outputs.upstream != ''
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.upstream }}
+        run: |
+          git fetch upstream --tags
+          git push origin --tags
