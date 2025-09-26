@@ -1,0 +1,186 @@
+name: Auto Fork Repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Repository to fork in the format owner/repo"
+        required: true
+      organization:
+        description: "Destination organization for the fork (defaults to the authenticated user)"
+        required: false
+      source_branch:
+        description: "Source branch from this repository to push to the fork (defaults to the current ref)"
+        required: false
+      target_branch:
+        description: "Branch name to create/update on the fork (defaults to the source branch)"
+        required: false
+      force_push:
+        description: "Force push the branch to the fork"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  fork-and-push:
+    name: Fork and push repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate token presence
+        run: |
+          if [ -z "${{ secrets.FORK_TOKEN }}" ]; then
+            echo "FORK_TOKEN secret is required to authenticate with the GitHub API." >&2
+            exit 1
+          fi
+
+      - name: Request fork and wait for availability
+        id: fork
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.FORK_TOKEN }}
+          script: |
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            const repoInput = core.getInput('repository', { required: true }).trim();
+            const organization = core.getInput('organization').trim();
+
+            const parts = repoInput.split('/');
+            if (parts.length !== 2 || !parts[0] || !parts[1]) {
+              core.setFailed(`Invalid repository format: "${repoInput}". Expected "owner/repo".`);
+              return;
+            }
+
+            const [sourceOwner, repoName] = parts;
+            const params = { owner: sourceOwner, repo: repoName };
+
+            let destinationOwner = organization;
+            if (organization) {
+              try {
+                await github.rest.orgs.get({ org: organization });
+              } catch (error) {
+                core.setFailed(`Unable to access organization "${organization}": ${error.message}`);
+                return;
+              }
+              params.organization = organization;
+            } else {
+              const authenticated = await github.rest.users.getAuthenticated();
+              destinationOwner = authenticated.data.login;
+            }
+
+            core.info(`Requesting fork of ${sourceOwner}/${repoName} to ${destinationOwner}.`);
+            try {
+              await github.rest.repos.createFork(params);
+            } catch (error) {
+              if (error.status === 403) {
+                core.setFailed(`Forbidden: ${error.message}`);
+                return;
+              }
+
+              const errorMessage = error?.response?.data?.message ?? error.message;
+              if (error.status === 422 && errorMessage && errorMessage.includes('name already exists on this account')) {
+                core.warning('Fork already exists for the destination. Reusing existing fork.');
+              } else {
+                throw error;
+              }
+            }
+
+            const maxAttempts = 30;
+            const delayMs = 5000;
+            let fork;
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                fork = await github.rest.repos.get({ owner: destinationOwner, repo: repoName });
+                break;
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Waiting for fork to be ready (attempt ${attempt}/${maxAttempts}).`);
+                  await sleep(delayMs);
+                  continue;
+                }
+                throw error;
+              }
+            }
+
+            if (!fork) {
+              core.setFailed('Timed out waiting for the forked repository to become available.');
+              return;
+            }
+
+            core.setOutput('fork-owner', destinationOwner);
+            core.setOutput('fork-repo', repoName);
+            core.setOutput('fork-url', fork.data.html_url);
+            core.setOutput('default-branch', fork.data.default_branch);
+
+            await core.summary
+              .addHeading('Fork ready')
+              .addLink(`${destinationOwner}/${repoName}`, fork.data.html_url)
+              .addRaw(`Default branch: ${fork.data.default_branch}`)
+              .write();
+
+      - name: Check out repository contents
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_branch || github.ref }}
+          persist-credentials: false
+
+      - name: Determine branches
+        id: branches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_BRANCH="${{ inputs.source_branch }}"
+          if [ -z "$SOURCE_BRANCH" ]; then
+            SOURCE_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          else
+            git checkout "$SOURCE_BRANCH"
+          fi
+
+          TARGET_BRANCH="${{ inputs.target_branch }}"
+          if [ -z "$TARGET_BRANCH" ]; then
+            TARGET_BRANCH="$SOURCE_BRANCH"
+          fi
+
+          echo "source=$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Push branch to fork
+        env:
+          FORK_REMOTE_URL: https://x-access-token:${{ secrets.FORK_TOKEN }}@github.com/${{ steps.fork.outputs.fork-owner }}/${{ steps.fork.outputs.fork-repo }}.git
+          SOURCE_BRANCH: ${{ steps.branches.outputs.source }}
+          TARGET_BRANCH: ${{ steps.branches.outputs.target }}
+          FORCE_PUSH: ${{ inputs.force_push }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+          if git remote get-url fork >/dev/null 2>&1; then
+            git remote set-url fork "$FORK_REMOTE_URL"
+          else
+            git remote add fork "$FORK_REMOTE_URL"
+          fi
+
+          PUSH_FLAGS="--force-with-lease"
+          if [ "$FORCE_PUSH" = "true" ]; then
+            PUSH_FLAGS="--force"
+          fi
+
+          git push $PUSH_FLAGS fork "$SOURCE_BRANCH:$TARGET_BRANCH"
+
+      - name: Summary
+        env:
+          FORK_URL: ${{ steps.fork.outputs.fork-url }}
+          SOURCE_BRANCH: ${{ steps.branches.outputs.source }}
+          TARGET_BRANCH: ${{ steps.branches.outputs.target }}
+        run: |
+          {
+            echo "Fork available at: $FORK_URL"
+            echo "Source branch pushed: $SOURCE_BRANCH"
+            echo "Target branch on fork: $TARGET_BRANCH"
+          } >> "$GITHUB_STEP_SUMMARY"
